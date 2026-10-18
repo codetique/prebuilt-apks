@@ -33,6 +33,7 @@ patches-source = "SysAdminDoc/hushfeed"
 rv-brand = "Hushfeed"
 build-mode = "apk"
 arch = "arm64-v8a"
+excluded-patches = "Remove unused language packs"
 archive-dlurl = "https://archive.org/download/que-apks/apks"
 
 [PineDrama-Hushfeed]
@@ -41,4 +42,5 @@ patches-source = "SysAdminDoc/hushfeed"
 rv-brand = "Hushfeed"
 build-mode = "apk"
 arch = "arm64-v8a"
+excluded-patches = "Remove unused language packs"
 archive-dlurl = "https://archive.org/download/que-apks/apks"
