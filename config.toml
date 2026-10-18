@@ -29,6 +29,7 @@ archive-dlurl = "https://archive.org/download/jhc-apks/apks/com.google.android.a
 
 [TikTok-Hushfeed]
 app-name = "TikTok"
+pkg-name = "com.zhiliaoapp.musically"
 patches-source = "SysAdminDoc/hushfeed"
 rv-brand = "Hushfeed"
 build-mode = "apk"
@@ -38,6 +39,7 @@ archive-dlurl = "https://archive.org/download/que-apks/apks"
 
 [PineDrama-Hushfeed]
 app-name = "PineDrama"
+pkg-name = "com.ss.android.ttmd.video"
 patches-source = "SysAdminDoc/hushfeed"
 rv-brand = "Hushfeed"
 build-mode = "apk"
