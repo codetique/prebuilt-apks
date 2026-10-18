@@ -6,6 +6,22 @@ TEMP_DIR="temp"
 BIN_DIR="bin"
 BUILD_DIR="build"
 DL_SRCS=("direct" "archive" "apkmirror")
+# split-bundle formats we can merge into a single apk (APKEditor handles all of them)
+BUNDLE_EXTS=("apkm" "apks" "xapk")
+# Browser-like request headers. A stale UA / missing headers is the usual cause of 403 from apkmirror (Cloudflare).
+# Optional: export CURL_BIN=curl_chrome131 (curl-impersonate) if plain curl still gets 403 from TLS fingerprinting.
+CURL_BIN=${CURL_BIN:-curl}
+BROWSER_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+BROWSER_HEADERS=(
+	-H "User-Agent: ${BROWSER_UA}"
+	-H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+	-H "Accept-Language: en-US,en;q=0.9"
+	-H "Upgrade-Insecure-Requests: 1"
+	-H "Sec-Fetch-Dest: document"
+	-H "Sec-Fetch-Mode: navigate"
+	-H "Sec-Fetch-Site: same-origin"
+	-H "Sec-Fetch-User: ?1"
+)
 
 if [ "${GITHUB_TOKEN-}" ]; then GH_HEADER="Authorization: token ${GITHUB_TOKEN}"; else GH_HEADER=; fi
 NEXT_VER_CODE=${NEXT_VER_CODE:-$(date +'%Y%m%d')}
@@ -242,7 +258,7 @@ _req() {
 			return
 		fi
 	fi
-	if ! curl -L -c "$TEMP_DIR/cookie.txt" -b "$TEMP_DIR/cookie.txt" --connect-timeout 10 --retry 1 --fail -s -S "$@" "$ip" -o "$dlp"; then
+	if ! "$CURL_BIN" -L -c "$TEMP_DIR/cookie.txt" -b "$TEMP_DIR/cookie.txt" --connect-timeout 10 --retry 2 --retry-delay 3 --retry-all-errors --fail -s -S "$@" "$ip" -o "$dlp"; then
 		epr "Request failed: $ip"
 		if [ "$dlp" != - ]; then rm -f "$dlp"; fi
 		return 1
@@ -251,7 +267,16 @@ _req() {
 		mv -f "$dlp" "$op"
 	fi
 }
-req() { _req "$1" "$2" -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"; }
+req() {
+	# REQ_REFERER can be set per call: the download.php link on apkmirror returns 403 without the previous page as Referer
+	local url=$1 out=$2 ref=${REQ_REFERER-}
+	if [ -z "$ref" ] && [[ $url == *apkmirror.com* ]]; then ref="https://www.apkmirror.com/"; fi
+	if [ -n "$ref" ]; then
+		_req "$url" "$out" --compressed "${BROWSER_HEADERS[@]}" -e "${ref};auto"
+	else
+		_req "$url" "$out" --compressed "${BROWSER_HEADERS[@]}"
+	fi
+}
 gh_req() { _req "$1" "$2" -H "$GH_HEADER"; }
 gh_dl() {
 	if [ ! -f "$1" ]; then
@@ -354,6 +379,36 @@ isoneof() {
 	return 1
 }
 
+# echoes the existing bundle file (<base>.apkm|.apks|.xapk) if any
+find_bundle() {
+	local base=$1 e
+	for e in "${BUNDLE_EXTS[@]}"; do
+		if [ -f "${base}.${e}" ]; then
+			echo "${base}.${e}"
+			return 0
+		fi
+	done
+	return 1
+}
+# true if the file name/url ends with a bundle extension
+is_bundle_ext() {
+	local ext=${1##*.}
+	ext=${ext,,}
+	isoneof "$ext" "${BUNDLE_EXTS[@]}"
+}
+# prints the base apk extracted (flat) in dir: base.apk (apkm/xapk) or base-master.apk (apks)
+bundle_base_apk() {
+	local dir=$1 f
+	for f in "$dir/base.apk" "$dir/base-master.apk"; do
+		if [ -f "$f" ]; then
+			echo "$f"
+			return 0
+		fi
+	done
+	f=$(find "$dir" -maxdepth 1 -name '*.apk' ! -name 'config.*' ! -name 'split_config.*' ! -name '*-[a-z][a-z].apk' | head -1)
+	[ -n "$f" ] && echo "$f"
+}
+
 merge_splits() {
 	local bundle=$1 output=$2
 	pr "Merging splits"
@@ -416,8 +471,9 @@ apkmirror_search() {
 dl_apkmirror() {
 	local url=$1 version=${2// /-} output=$3 arch=$4 dpi=$5 is_bundle=false
 
-	if [ -f "${output}.apkm" ]; then
-		merge_splits "${output}.apkm" "${output}"
+	local existing_bundle
+	if existing_bundle=$(find_bundle "$output"); then
+		merge_splits "$existing_bundle" "${output}"
 		return 0
 	fi
 
@@ -425,8 +481,10 @@ dl_apkmirror() {
 	local resp node app_table apkmname dlurl=""
 	apkmname=$($HTMLQ "h1.marginZero" --text <<<"$__APKMIRROR_RESP__")
 	apkmname="${apkmname,,}" apkmname="${apkmname// /-}" apkmname="${apkmname//[^a-z0-9-]/}"
-	url="${url}/${apkmname}-${version//./-}-release/"
-	resp=$(req "$url" -) || return 1
+	# every hop sends the previous page as Referer, otherwise apkmirror answers 403 on the final download.php link
+	local rel_url="${url}/${apkmname}-${version//./-}-release/" page_ref
+	page_ref=$rel_url
+	resp=$(req "$rel_url" -) || return 1
 	node=$($HTMLQ "div.table-row.headerFont:nth-last-child(1)" -r "span:nth-child(n+3)" <<<"$resp")
 	if [ "$node" ]; then
 		for type in APK BUNDLE; do
@@ -438,16 +496,28 @@ dl_apkmirror() {
 			fi
 		done
 		if [ -z "$dlurl" ]; then return 1; fi
-		resp=$(req "$dlurl" -)
+		resp=$(REQ_REFERER=$rel_url req "$dlurl" -) || return 1
+		page_ref=$dlurl
 	fi
-	url=$(echo "$resp" | $HTMLQ --base https://www.apkmirror.com --attribute href "a.btn") || return 1
-	url=$(req "$url" - | $HTMLQ --base https://www.apkmirror.com --attribute href "span > a[rel = nofollow]") || return 1
+	local dlpage_url
+	dlpage_url=$(echo "$resp" | $HTMLQ --base https://www.apkmirror.com --attribute href "a.btn" | head -1)
+	if [ -z "$dlpage_url" ]; then
+		epr "apkmirror: download page link not found"
+		return 1
+	fi
+	resp=$(REQ_REFERER=$page_ref req "$dlpage_url" -) || return 1
+	url=$(echo "$resp" | $HTMLQ --base https://www.apkmirror.com --attribute href "span > a[rel = nofollow]" | head -1)
+	if [ -z "$url" ]; then
+		epr "apkmirror: final download link not found"
+		return 1
+	fi
 
 	if [ "$is_bundle" = true ]; then
-		req "$url" "${output}.apkm" || return 1
+		# apkmirror serves its bundles as .apkm
+		REQ_REFERER=$dlpage_url req "$url" "${output}.apkm" || return 1
 		merge_splits "${output}.apkm" "${output}"
 	else
-		req "$url" "${output}" || return 1
+		REQ_REFERER=$dlpage_url req "$url" "${output}" || return 1
 	fi
 }
 get_apkmirror_vers() {
@@ -493,7 +563,7 @@ dl_uptodown() {
 		if ! op=$(jq -e -r ".data | map(select(.version == \"${version}\")) | .[0]" <<<"$resp"); then
 			continue
 		fi
-		if [ "$(jq -e -r ".kindFile" <<<"$op")" = "xapk" ]; then is_bundle=true; fi
+		if isoneof "$(jq -e -r ".kindFile" <<<"$op")" "${BUNDLE_EXTS[@]}"; then is_bundle=true; fi
 		if versionURL=$(jq -e -r '.versionURL' <<<"$op"); then break; else return 1; fi
 	done
 	if [ -z "$versionURL" ]; then return 1; fi
@@ -514,7 +584,7 @@ dl_uptodown() {
 			if ! isoneof "$node_arch" "${apparch[@]}"; then continue; fi
 
 			file_type=$($HTMLQ -w -t ".content > :nth-child($n) > .v-file > span" <<<"$files") || return 1
-			if [ "$file_type" = "xapk" ]; then is_bundle=true; else is_bundle=false; fi
+			if isoneof "$file_type" "${BUNDLE_EXTS[@]}"; then is_bundle=true; else is_bundle=false; fi
 			data_file_id=$($HTMLQ ".content > :nth-child($n) > .v-report" --attribute data-file-id <<<"$files") || return 1
 			resp=$(req "${uptodown_dlurl}/download/${data_file_id}-x" -)
 			break
@@ -537,8 +607,9 @@ dl_archive() {
 	local url=$1 version=$2 output=$3 arch=$4
 	local path version=${version// /}
 
-	if [ -f "${output}.apkm" ]; then
-		merge_splits "${output}.apkm" "$output"
+	local existing_bundle
+	if existing_bundle=$(find_bundle "$output"); then
+		merge_splits "$existing_bundle" "$output"
 		return 0
 	fi
 
@@ -546,9 +617,10 @@ dl_archive() {
 		path=$(grep -m1 "${version_f#v}-all" <<<"$__ARCHIVE_RESP__") || return 1
 	fi
 
-	if [ "${path##*.}" = "apkm" ]; then
-		req "${url}/${path}" "${output}.apkm" || return 1
-		merge_splits "${output}.apkm" "$output"
+	if is_bundle_ext "$path"; then
+		local bundle_ext=${path##*.}
+		req "${url}/${path}" "${output}.${bundle_ext,,}" || return 1
+		merge_splits "${output}.${bundle_ext,,}" "$output"
 	else
 		req "${url}/${path}" "${output}" || return 1
 	fi
@@ -559,7 +631,7 @@ get_archive_resp() {
 	r=$(req "$1" -)
 	if [ -z "$r" ]; then return 1; else __ARCHIVE_RESP__=$(sed -n 's;^<a href="\(.*\)"[^"]*;\1;p' <<<"$r"); fi
 }
-get_archive_vers() { sed 's/^[^-]*-//;s/-\(all\|arm64-v8a\|arm-v7a\)\.\(apk\|apkm\)//g' <<<"$__ARCHIVE_RESP__"; }
+get_archive_vers() { sed 's/^[^-]*-//;s/-\(all\|arm64-v8a\|arm-v7a\)\.\(apkm\|apks\|xapk\|apk\)//g' <<<"$__ARCHIVE_RESP__"; }
 get_archive_pkg_name() { echo "$__ARCHIVE_PKG_NAME__"; }
 
 # -------------------- direct --------------------
@@ -569,9 +641,15 @@ dl_direct() {
 		epr "Given direct-dlurl for $output is not compatible. Set proper 'arch' and 'version' options."
 		return 1
 	fi
-	if [ "${url##*.}" = "apkm" ]; then
-		req "$url" "${output}.apkm" || return 1
-		merge_splits "${output}.apkm" "$output"
+	local existing_bundle
+	if existing_bundle=$(find_bundle "$output"); then
+		merge_splits "$existing_bundle" "$output"
+		return 0
+	fi
+	if is_bundle_ext "$url"; then
+		local bundle_ext=${url##*.}
+		req "$url" "${output}.${bundle_ext,,}" || return 1
+		merge_splits "${output}.${bundle_ext,,}" "$output"
 	else
 		req "$url" "${output}" || return 1
 	fi
@@ -719,11 +797,15 @@ build_rv() {
 		fi
 	fi
 
-	local sig_op
-	if [ -f "${stock_apk}.apkm" ]; then
+	local sig_op stock_bundle=""
+	if stock_bundle=$(find_bundle "$stock_apk"); then
 		rm -rf "${stock_apk}-zip" || :
-		unzip -j "${stock_apk}.apkm" -d "${stock_apk}-zip" >/dev/null
-		local a="${stock_apk}-zip/base.apk"
+		unzip -j "$stock_bundle" '*.apk' -d "${stock_apk}-zip" >/dev/null
+		local a
+		a=$(bundle_base_apk "${stock_apk}-zip") || {
+			epr "Not building $table, base apk not found in '$stock_bundle'"
+			return 0
+		}
 		if ! sig_op=$(check_sig "$a" "$pkg_name" 2>&1); then
 			epr "Not building $table, apk signature mismatch '$a': $sig_op"
 			return 0
@@ -858,20 +940,23 @@ build_rv() {
 			if [ "${args[include_stock]}" = "merged" ]; then
 				cp -f "$stock_apk" "${base_template}/stock/base.apk"
 			elif [ "${args[include_stock]}" = "split" ]; then
-				if [ ! -f "${stock_apk}.apkm" ]; then
-					epr "Cannot include as 'split' because stock apk of $table_name is not a bundle"
+				if [ -z "$stock_bundle" ]; then
+					epr "Cannot include as 'split' because stock apk of $table is not a bundle"
 					return 0
 				fi
+				# .apks (bundletool) keeps device splits under splits/ and universal apks under standalones/
+				local split_inc='*.apk'
+				if unzip -l "$stock_bundle" 2>/dev/null | grep -q ' splits/.*\.apk$'; then split_inc='splits/*.apk'; fi
 				if [ "$arch" = "arm64-v8a" ]; then
-					unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*x86.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+					unzip -j "$stock_bundle" "$split_inc" -x '*x86_64.apk' -x '*x86.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
 				elif [ "$arch" = "arm-v7a" ]; then
-					unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*x86.apk' -x '*arm64_v8a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+					unzip -j "$stock_bundle" "$split_inc" -x '*x86_64.apk' -x '*x86.apk' -x '*arm64_v8a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
 				elif [ "$arch" = "x86" ]; then
-					unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*arm64_v8a.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+					unzip -j "$stock_bundle" "$split_inc" -x '*x86_64.apk' -x '*arm64_v8a.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
 				elif [ "$arch" = "x86_64" ]; then
-					unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86.apk' -x '*arm64_v8a.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+					unzip -j "$stock_bundle" "$split_inc" -x '*x86.apk' -x '*arm64_v8a.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
 				else
-					unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*x86.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+					unzip -j "$stock_bundle" "$split_inc" -x '*x86_64.apk' -x '*x86.apk' -d "${base_template}/stock/" >/dev/null 2>&1
 				fi
 			fi
 		fi
